@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "type": "module",
   "private": true,
+  "engines": {
+    "node": ">=20.0.0"
+  },
   "scripts": {
     "dev": "node --watch src/index.js",
     "start": "node src/index.js"
@@ -13,6 +16,6 @@
     "express": "^4.19.2",
     "groq-sdk": "^0.7.0",
     "multer": "^2.0.0",
-    "pg": "^8.23.1"
+    "pg": "^8.12.0"
   }
 }
