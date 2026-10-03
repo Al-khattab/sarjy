@@ -1,71 +1,64 @@
-import fs from "node:fs";
-import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { groq, MODELS } from "./groq.js";
+import { pool, schemaReady } from "./db.js";
 
-// Prototype-grade persistence: one JSON file on disk. This satisfies "remembers
-// across sessions" for a single deployment/browser, but it will NOT survive a
-// redeploy on most free hosts (the filesystem gets reset). Swap this module
-// for Postgres (see PRD §13.2 — users/facts/messages tables) before relying
-// on it for the real demo, or make sure your host has a persistent disk.
 
-const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const DB_PATH = path.join(__dirname, "..", "data", "memory.json");
-
-function readDb() {
-  try {
-    return JSON.parse(fs.readFileSync(DB_PATH, "utf-8"));
-  } catch {
-    return { users: {} };
-  }
+export async function getFacts(userId) {
+  await schemaReady;
+  const { rows } = await pool.query(
+    "SELECT key, value FROM facts WHERE user_id = $1",
+    [userId]
+  )
+  return Object.fromEntries(rows.map((r) => [r.key, r.value]));
 }
 
-function writeDb(db) {
-  fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
-  fs.writeFileSync(DB_PATH, JSON.stringify(db, null, 2));
+export async function appendMessage(userId, role, content) {
+  await schemaReady;
+  await pool.query(
+    "INSERT INTO messages (user_id, role, content) VALUES ($1, $2, $3)",
+    [userId, role, content]
+  );
 }
 
-function getUser(db, userId) {
-  if (!db.users[userId]) {
-    db.users[userId] = { facts: {}, messages: [] };
-  }
-  return db.users[userId];
+export async function getRecentMessages(userId, limit = 12) {
+  await schemaReady;
+  const { rows } = await pool.query(
+    `SELECT role, content FROM messages
+     WHERE user_id = $1
+     ORDER BY created_at DESC
+     LIMIT $2`,
+    [userId, limit]);
+    return rows.reverse(); 
 }
 
-export function getFacts(userId) {
-  const db = readDb();
-  return getUser(db, userId).facts;
-}
-
-export function appendMessage(userId, role, content) {
-  const db = readDb();
-  const user = getUser(db, userId);
-  user.messages.push({ role, content, at: Date.now() });
-  // keep the on-disk log bounded; the LLM only ever sees a recent slice anyway
-  user.messages = user.messages.slice(-100);
-  writeDb(db);
-}
-
-export function getRecentMessages(userId, limit = 12) {
-  const db = readDb();
-  return getUser(db, userId).messages.slice(-limit);
-}
-
-export function setFacts(userId, updates) {
+export async function setFacts(userId, updates) {
   if (!updates || updates.length === 0) return;
-  const db = readDb();
-  const user = getUser(db, userId);
-  for (const { key, value } of updates) {
-    if (!key || !value) continue;
-    user.facts[key] = value;
+  await schemaReady;
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    for (const { key, value } of updates) {
+      if (!key || !value) continue;
+      await client.query(
+        `INSERT INTO facts (user_id, key, value, updated_at)
+         VALUES ($1, $2, $3, now())
+         ON CONFLICT (user_id, key)
+         DO UPDATE SET value = EXCLUDED.value, updated_at = now()`,
+        [userId, key, value]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (err) {
+    await client.query("ROLLBACK");
+    throw err;
+  } finally {
+    client.release();
   }
-  writeDb(db);
 }
 
-export function clearUser(userId) {
-  const db = readDb();
-  delete db.users[userId];
-  writeDb(db);
+export async function clearUser(userId) {
+  await schemaReady;
+  await pool.query("DELETE FROM facts WHERE user_id = $1", [userId]);
+  await pool.query("DELETE FROM messages WHERE user_id = $1", [userId]);
 }
 
 /**

@@ -34,8 +34,9 @@ chatRouter.post("/", async (req, res) => {
   };
 
   try {
-    const facts = getFacts(userId);
-    const history = getRecentMessages(userId).map((m) => ({
+    const facts = await getFacts(userId);
+    const recent = await getRecentMessages(userId);
+    const history = recent.map((m) => ({
       role: m.role,
       content: m.content,
     }));
@@ -49,7 +50,6 @@ chatRouter.post("/", async (req, res) => {
     // --- First pass: let the model decide if it needs the weather tool ---
     // (Not streamed — a tool-calling turn can't stream partial tool_calls
     // usefully. This is the extra hop the latency deep dive should target:
-    // see TDD §13.4 on speculative/parallel tool execution.)
     const first = await groq.chat.completions.create({
       model: MODELS.chat,
       messages,
@@ -100,8 +100,8 @@ chatRouter.post("/", async (req, res) => {
     }
     mark("llm_done");
 
-    appendMessage(userId, "user", message);
-    appendMessage(userId, "assistant", full);
+    await appendMessage(userId, "user", message);
+    await appendMessage(userId, "assistant", full);
 
     sse(res, "done", { text: full, timings });
     res.end();
