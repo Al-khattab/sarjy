@@ -19,7 +19,8 @@ function sse(res, event, data) {
 chatRouter.post("/", async (req, res) => {
   const userId = req.header("x-user-id");
   const { message } = req.body || {};
-  if (!userId) return res.status(400).json({ error: "Missing x-user-id header" });
+  if (!userId)
+    return res.status(400).json({ error: "Missing x-user-id header" });
   if (!message) return res.status(400).json({ error: "Missing message" });
 
   res.setHeader("Content-Type", "text/event-stream");
@@ -27,15 +28,20 @@ chatRouter.post("/", async (req, res) => {
   res.setHeader("Connection", "keep-alive");
   res.flushHeaders?.();
 
-  const timings = { received: Date.now() };
-  const mark = (name) => {
-    timings[name] = Date.now();
-    sse(res, "timing", { name, at: timings[name] });
-  };
+  const t0 = Date.now();
+  // Relative to request start, not absolute — avoids comparing the server's
+  // clock to the client's clock across the network, which is unreliable.
+  const mark = (name) => sse(res, "timing", { name, ms: Date.now() - t0 });
 
   try {
-    const facts = await getFacts(userId);
-    const recent = await getRecentMessages(userId);
+    // Both memory reads run concurrently instead of sequentially — one
+    // Neon round trip saved per turn, for free.
+    const [facts, recent] = await Promise.all([
+      getFacts(userId),
+      getRecentMessages(userId),
+    ]);
+    mark("memory_loaded");
+
     const history = recent.map((m) => ({
       role: m.role,
       content: m.content,
@@ -47,67 +53,102 @@ chatRouter.post("/", async (req, res) => {
       { role: "user", content: message },
     ];
 
-    // --- First pass: let the model decide if it needs the weather tool ---
-    // (Not streamed — a tool-calling turn can't stream partial tool_calls
-    // usefully. This is the extra hop the latency deep dive should target:
-    const first = await groq.chat.completions.create({
+    // Single streamed call from the start. Most turns never need the
+    // weather tool, so this is now the ONLY Groq round trip for the common
+    // case. The previous version always paid for a separate, non-streamed
+    // "decide if a tool is needed" call before this one, on every turn —
+    // this was the single biggest avoidable cost in the pipeline.
+    const stream = await groq.chat.completions.create({
       model: MODELS.chat,
       messages,
       tools: [weatherToolDefinition],
       tool_choice: "auto",
-    });
-    mark("llm_decision");
-
-    const choice = first.choices[0];
-    const toolCalls = choice.message.tool_calls;
-    let finalMessages = messages;
-
-    if (toolCalls && toolCalls.length > 0) {
-      finalMessages = [...messages, choice.message];
-      for (const call of toolCalls) {
-        if (call.function.name === "get_weather") {
-          const args = JSON.parse(call.function.arguments || "{}");
-          const result = await getWeather(args.location);
-          mark("tool_result");
-          finalMessages.push({
-            role: "tool",
-            tool_call_id: call.id,
-            content: JSON.stringify(result),
-          });
-        }
-      }
-    }
-
-    // --- Second pass: stream the actual spoken reply ---
-    const stream = await groq.chat.completions.create({
-      model: MODELS.chat,
-      messages: finalMessages,
       stream: true,
     });
 
     let full = "";
     let firstToken = false;
+    let toolCall = null; // { id, name, args } — accumulated across chunks
+
     for await (const chunk of stream) {
-      const delta = chunk.choices[0]?.delta?.content || "";
-      if (delta && !firstToken) {
-        firstToken = true;
-        mark("llm_first_token");
+      const delta = chunk.choices[0]?.delta;
+      const finishReason = chunk.choices[0]?.finish_reason;
+
+      if (delta?.tool_calls) {
+        // NOTE: assumes a single tool call per turn
+        const call = delta.tool_calls[0];
+        if (!toolCall) {
+          toolCall = { id: call.id, name: call.function?.name, args: "" };
+        }
+        if (call.function?.arguments) toolCall.args += call.function.arguments;
+        continue; // tool-call deltas aren't spoken content
       }
-      if (delta) {
-        full += delta;
-        sse(res, "token", { text: delta });
+
+      if (delta?.content) {
+        if (!firstToken) {
+          firstToken = true;
+          mark("llm_first_token");
+        }
+        full += delta.content;
+        sse(res, "token", { text: delta.content });
+      }
+
+      if (finishReason === "tool_calls" && toolCall) {
+        mark("tool_call_detected");
+        const args = JSON.parse(toolCall.args || "{}");
+        const result = await getWeather(args.location);
+        mark("tool_result");
+
+        const followUp = await groq.chat.completions.create({
+          model: MODELS.chat,
+          stream: true,
+          messages: [
+            ...messages,
+            {
+              role: "assistant",
+              content: null,
+              tool_calls: [
+                {
+                  id: toolCall.id,
+                  type: "function",
+                  function: { name: toolCall.name, arguments: toolCall.args },
+                },
+              ],
+            },
+            {
+              role: "tool",
+              tool_call_id: toolCall.id,
+              content: JSON.stringify(result),
+            },
+          ],
+        });
+
+        let followUpFirstToken = false;
+        for await (const fchunk of followUp) {
+          const fdelta = fchunk.choices[0]?.delta?.content;
+          if (fdelta) {
+            if (!followUpFirstToken) {
+              followUpFirstToken = true;
+              mark("llm_first_token_after_tool");
+            }
+            full += fdelta;
+            sse(res, "token", { text: fdelta });
+          }
+        }
       }
     }
+
     mark("llm_done");
-
-    await appendMessage(userId, "user", message);
-    await appendMessage(userId, "assistant", full);
-
-    sse(res, "done", { text: full, timings });
+    sse(res, "done", { text: full });
     res.end();
 
-    // Fire-and-forget: don't hold up the response for fact extraction.
-    extractFacts(message, full).then((facts) => setFacts(userId, facts));
+    // Fire-and-forget: never block the response on persistence.
+    Promise.all([
+      appendMessage(userId, "user", message),
+      appendMessage(userId, "assistant", full),
+    ]).catch((err) => console.error("[sarjy] message log failed:", err));
+
+    extractFacts(message, full).then((updates) => setFacts(userId, updates));
   } catch (err) {
     console.error("[sarjy] chat failed:", err);
     sse(res, "error", { message: err.message });

@@ -400,6 +400,16 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+.latency-panel__ttfa {
+  margin: 8px 0 4px;
+  font-size: 13px;
+  color: var(--text);
+}
+.latency-panel__ttfa strong {
+  color: var(--brass);
+  font-variant-numeric: tabular-nums;
+}
+
 /* ---------------------------------------------------------------
    Avatar
    --------------------------------------------------------------- */

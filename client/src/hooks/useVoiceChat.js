@@ -24,7 +24,7 @@ function getUserId() {
  * - `listening`: microphone is recording.
  * - `transcribing`: audio is being sent to `/api/transcribe`.
  * - `thinking`: waiting for / streaming the LLM reply from `/api/chat`.
- * - `speaking`: reply is being played via `/api/speak` (or browser TTS fallback).
+ * - `speaking`: one or more sentences are queued/playing via `speechSynthesis`.
  */
 
 /**
@@ -36,11 +36,13 @@ function getUserId() {
 
 /**
  * @typedef {Object} TurnTimings
- * Milliseconds since the epoch, keyed by checkpoint name.
- * `turn_start` is set client-side; other keys come from server `timing` SSE
- * events (`{ name, at }`), so the available keys depend on the backend.
- * @property {number} turn_start Client timestamp (`Date.now()`) when the turn began.
- * @property {number} [key] Additional server-provided checkpoints.
+ * Milliseconds SINCE THE SERVER RECEIVED THE REQUEST, keyed by checkpoint
+ * name — these come straight from the server's `timing` SSE events
+ * (`{ name, ms }`) and are not compared against the client's own clock, to
+ * avoid cross-machine clock-skew error. Available keys depend on whether a
+ * tool call happened this turn (see chat.js).
+ * @property {number} [key] e.g. memory_loaded, llm_first_token, tool_result,
+ *   llm_first_token_after_tool, llm_done.
  */
 
 /**
@@ -49,7 +51,13 @@ function getUserId() {
  * @property {ChatMessage[]} messages Conversation history, oldest first.
  * @property {string | null} errorText User-facing error message, or `null`.
  *   Cleared when listening starts.
- * @property {TurnTimings | null} timings Latency checkpoints for the latest turn.
+ * @property {TurnTimings | null} timings Server-reported latency checkpoints
+ *   for the latest turn, relative to that request's start.
+ * @property {number | null} ttfa Time-to-first-audible-word for the latest
+ *   turn, in ms, measured client-side from mic-release to the first spoken
+ *   utterance actually starting. This is the headline "did it feel fast"
+ *   number — it accounts for STT + chat + speech synthesis start, not just
+ *   the LLM's first token.
  * @property {() => Promise<void>} startListening Requests the mic and begins recording.
  * @property {() => void} stopListening Stops recording, which triggers transcription
  *   and the rest of the turn.
@@ -67,11 +75,12 @@ function getUserId() {
  *
  * 1. **Listen**: records mic audio with `MediaRecorder`.
  * 2. **Transcribe**: POSTs the audio to `/api/transcribe` (expects `{ text }`).
- * 3. **Think**: POSTs the text to `/api/chat` and reads a Server-Sent Events
- *    stream (`token`, `timing`, `error` events), updating the last assistant
- *    message live.
- * 4. **Speak**: POSTs the full reply to `/api/speak` and plays the returned
- *    audio, falling back to the browser's `speechSynthesis` on failure.
+ * 3. **Think + Speak**: POSTs the text to `/api/chat` and reads a
+ *    Server-Sent Events stream (`token`, `timing`, `error` events). As soon
+ *    as a complete sentence has streamed in, it's queued to
+ *    `speechSynthesis` immediately — we don't wait for the full reply
+ *    before speaking starts, which is the main lever for perceived latency
+ *    now that TTS is local instead of a network call.
  *
  * Errors surface through `errorText` and return the state to `idle`, so the
  * next mic press always starts a fresh turn.
@@ -101,68 +110,78 @@ export function useVoiceChat() {
   const [errorText, setErrorText] = useState(null);
   /** @type {[TurnTimings | null, Function]} */
   const [timings, setTimings] = useState(null);
+  /** @type {[number | null, Function]} */
+  const [ttfa, setTtfa] = useState(null);
 
   /** @type {React.MutableRefObject<MediaRecorder | null>} Active recorder. */
   const mediaRecorderRef = useRef(null);
   /** @type {React.MutableRefObject<Blob[]>} Audio chunks for the current recording. */
   const chunksRef = useRef([]);
-  /** @type {React.MutableRefObject<HTMLAudioElement | null>} Currently playing TTS audio. */
-  const audioElRef = useRef(null);
   /** @type {React.MutableRefObject<string>} Stable anonymous user id. */
   const userId = useRef(getUserId());
+  /** @type {React.MutableRefObject<number>} performance.now() when the mic
+   *  was released for the in-flight turn — the start point for TTFA. */
+  const recordingStoppedAt = useRef(0);
 
   /**
-   * Speaks `text` aloud. Tries server TTS (`/api/speak`) first and falls back
-   * to `speechSynthesis` if the request or decoding throws. Resolves when
-   * playback ends (or fails) and always resets state to `idle`.
+   * Speaks one sentence via the browser's `speechSynthesis`. Calling this
+   * repeatedly queues utterances in order — `speechSynthesis` plays them
+   * back to back, so sentences can be handed off as they stream in rather
+   * than waiting for the whole reply.
    *
-   * NOTE: the object URL is never revoked, so each reply leaks a small blob
-   * until the page unloads.
+   * The FIRST utterance of a turn marks `ttfa` on its `onstart` event (the
+   * moment sound actually begins), and `state` returns to `idle` once the
+   * LAST queued utterance for the turn finishes.
    *
-   * @param {string} text Text to synthesize.
-   * @returns {Promise<void>}
+   * @param {string} text Sentence to speak.
+   * @param {{ isFirst: boolean }} flags Whether this is the turn's first utterance.
+   * @param {React.MutableRefObject<number>} pendingRef Count of utterances
+   *   still queued/playing for this turn, shared across calls.
    */
-  const speak = useCallback(async (text) => {
-    setState("speaking");
-    try {
-      const res = await fetch("/api/speak", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (!res.ok) throw new Error("TTS request failed");
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-      audioElRef.current = audio;
-      await new Promise((resolve) => {
-        audio.onended = resolve;
-        audio.onerror = resolve;
-        audio.play().catch(resolve);
-      });
-    } catch {
-      // Fallback: browser TTS, so the loop still completes even if the
-      // Groq TTS call fails
-      await new Promise((resolve) => {
-        const utter = new SpeechSynthesisUtterance(text);
-        utter.onend = resolve;
-        utter.onerror = resolve;
-        window.speechSynthesis.speak(utter);
-      });
-    } finally {
-      setState("idle");
+  const speakSentence = useCallback((text, flags, pendingRef) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+
+    const utter = new SpeechSynthesisUtterance(trimmed);
+    pendingRef.current += 1;
+
+    if (flags.isFirst) {
+      flags.isFirst = false;
+      utter.onstart = () => {
+        setState("speaking");
+        setTtfa(performance.now() - recordingStoppedAt.current);
+      };
     }
+
+    const onSettled = () => {
+      pendingRef.current -= 1;
+      if (pendingRef.current <= 0) setState("idle");
+    };
+    utter.onend = onSettled;
+    utter.onerror = onSettled;
+
+    window.speechSynthesis.speak(utter);
   }, []);
 
   /**
-   * Sends user text to `/api/chat`, streams the reply into `messages`, then
-   * calls {@link speak} with the complete reply.
+   * Sends user text to `/api/chat` and streams the reply. As sentence
+   * boundaries appear in the streamed text, each sentence is immediately
+   * queued to speech via {@link speakSentence} instead of waiting for the
+   * full reply to finish — this is what makes the assistant start talking
+   * mid-generation rather than after a full pause.
    *
-   * Appends the user message and an empty assistant placeholder immediately,
-   * then fills the placeholder as `token` events arrive. SSE events handled:
-   * - `timing`: `{ name: string, at: number }`, merged into `timings`.
-   * - `token`: `{ text: string }`, appended to the assistant message.
+   * SSE events handled:
+   * - `timing`: `{ name: string, ms: number }` — server-relative duration,
+   *   merged into `timings` as-is (see the {@link TurnTimings} typedef for
+   *   why this isn't compared against a client timestamp).
+   * - `token`: `{ text: string }`, appended to the assistant message and to
+   *   the sentence buffer.
    * - `error`: `{ message: string }`, surfaced via `errorText`.
+   *
+   * Sentence splitting is a simple trailing-punctuation check (`.`, `!`,
+   * `?`). It'll occasionally split early on abbreviations or decimals
+   * ("Dr.", "3.5") — an acceptable trade-off for a take-home; a sentence
+   * tokenizer would be the fix with more time.
    *
    * On a non-OK response, sets `errorText` and returns to `idle`.
    *
@@ -174,7 +193,8 @@ export function useVoiceChat() {
       setState("thinking");
       setMessages((m) => [...m, { role: "user", content: userText }]);
       setMessages((m) => [...m, { role: "assistant", content: "" }]);
-      const localTimings = { turn_start: Date.now() };
+      setTtfa(null);
+      const localTimings = {};
 
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -195,6 +215,10 @@ export function useVoiceChat() {
       const decoder = new TextDecoder();
       let buffer = "";
       let full = "";
+      let sentenceBuffer = "";
+
+      const speakFlags = { isFirst: true };
+      const pendingUtterances = { current: 0 };
 
       // Minimal hand-rolled SSE parser — EventSource can't be used because
       // it only supports GET requests, and we need to send a POST body.
@@ -218,29 +242,44 @@ export function useVoiceChat() {
           const data = JSON.parse(dataLine.replace("data:", "").trim());
 
           if (event === "timing") {
-            localTimings[data.name] = data.at;
+            localTimings[data.name] = data.ms;
             setTimings({ ...localTimings });
           } else if (event === "token") {
             full += data.text;
+            sentenceBuffer += data.text;
             setMessages((m) => {
               const copy = [...m];
               copy[copy.length - 1] = { role: "assistant", content: full };
               return copy;
             });
+
+            if (/[.!?]$/.test(sentenceBuffer.trim())) {
+              speakSentence(sentenceBuffer, speakFlags, pendingUtterances);
+              sentenceBuffer = "";
+            }
           } else if (event === "error") {
             setErrorText(data.message);
           }
         }
       }
 
-      await speak(full);
+      if (sentenceBuffer.trim()) {
+        speakSentence(sentenceBuffer, speakFlags, pendingUtterances);
+      } else if (pendingUtterances.current === 0) {
+        // Nothing was ever queued (empty/failed reply) — don't get stuck in "thinking".
+        setState("idle");
+      }
     },
-    [speak]
+    [speakSentence]
   );
 
   /**
    * Requests microphone access and starts recording. On stop, uploads the audio
    * to `/api/transcribe` and forwards the transcript to {@link sendToChat}.
+   *
+   * Records `recordingStoppedAt` the moment the mic is released — this is
+   * the reference point `ttfa` is measured from, so it has to be captured
+   * here rather than later in the pipeline.
    *
    * Failure handling (all set `errorText` and return to `idle`):
    * - mic permission denied / unavailable
@@ -257,6 +296,7 @@ export function useVoiceChat() {
       chunksRef.current = [];
       recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
       recorder.onstop = async () => {
+        recordingStoppedAt.current = performance.now();
         // Release the mic so the browser's recording indicator turns off.
         stream.getTracks().forEach((t) => t.stop());
         setState("transcribing");
@@ -301,11 +341,16 @@ export function useVoiceChat() {
    * Text-input alternative to the mic (e.g. when permission is denied or in
    * noisy environments). Runs the same chat -> speak pipeline.
    *
+   * NOTE: `ttfa` will measure from "now" rather than from a mic release,
+   * since there's no recording step in this path — treat ttfa as
+   * voice-turn-only data when analyzing it.
+   *
    * @param {string} text The message to send.
    * @returns {void}
    */
   const sendTextFallback = useCallback(
     (text) => {
+      recordingStoppedAt.current = performance.now();
       sendToChat(text);
     },
     [sendToChat]
@@ -331,6 +376,7 @@ export function useVoiceChat() {
     messages,
     errorText,
     timings,
+    ttfa,
     startListening,
     stopListening,
     sendTextFallback,
