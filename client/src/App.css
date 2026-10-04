@@ -1,8 +1,9 @@
 /* ---------------------------------------------------------------
    Design tokens
    Warm charcoal + brass, echoing the sarj.ai wordmark and paperclip
-   mark rather than a generic dark-mode SaaS palette.
    --------------------------------------------------------------- */
+
+@import url("https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,400;9..144,600&family=Inter:wght@400;500&display=swap");
 :root {
   --bg: #14140f;
   --surface: #1c1c16;
@@ -23,6 +24,7 @@
 
 * {
   box-sizing: border-box;
+  margin: 0;
 }
 
 html,
@@ -261,55 +263,102 @@ body {
 /* ---------------------------------------------------------------
    Transcript
    --------------------------------------------------------------- */
-.transcript {
-  width: 100%;
-  display: flex;
-  flex-direction: column;
-  gap: 12px;
-}
+   .transcript {
+    width: 100%;
+    height: 100%;
+  
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+  
+    padding: 16px;
+  
+    overflow-y: auto;
+    overflow-x: hidden;
+  
+    box-sizing: border-box;
+  
+    overscroll-behavior: contain;
+  
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) transparent;
+  }
+  
+  .transcript::-webkit-scrollbar {
+    width: 6px;
+  }
+  
+  .transcript::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  
+  .transcript::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 999px;
+  }
+  
+  .transcript--empty {
+    color: var(--text-muted);
+    font-size: 14px;
+    line-height: 1.7;
+    text-align: center;
+  
+    /* Empty state shouldn't need scrolling */
+    overflow: hidden;
+    justify-content: center;
+  }
+  
+  .transcript--empty em {
+    color: var(--text);
+    font-style: normal;
+  }
+  
+  .bubble {
+    border-radius: 12px;
+    padding: 10px 14px;
+    max-width: 88%;
+    border: 1px solid var(--border);
+  
+    /* Don't let long content break the layout */
+    overflow-wrap: anywhere;
+  }
+  
+  .bubble p {
+    margin: 2px 0 0;
+    font-size: 15px;
+    line-height: 1.5;
+  }
+  
+  .bubble__role {
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-muted);
+  }
+  
+  .bubble--user {
+    align-self: flex-end;
+    background: var(--surface);
+  }
+  
+  .bubble--assistant {
+    align-self: flex-start;
+    background: var(--brass-soft);
+    border-color: var(--brass);
+  }
 
-.transcript--empty {
-  color: var(--text-muted);
-  font-size: 14px;
-  line-height: 1.7;
-  text-align: center;
-}
-
-.transcript--empty em {
-  color: var(--text);
-  font-style: normal;
-}
-
-.bubble {
-  border-radius: 12px;
-  padding: 10px 14px;
-  max-width: 88%;
-  border: 1px solid var(--border);
-}
-
-.bubble p {
-  margin: 2px 0 0;
-  font-size: 15px;
-  line-height: 1.5;
-}
-
-.bubble__role {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-}
-
-.bubble--user {
-  align-self: flex-end;
-  background: var(--surface);
-}
-
-.bubble--assistant {
-  align-self: flex-start;
-  background: var(--brass-soft);
-  border-color: var(--brass);
-}
+  .chat {
+    width: 100%;
+    height: clamp(280px, 45vh, 480px);
+    min-height: 0;
+    overflow: hidden;
+  
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    overflow: hidden;
+  
+    background: var(--surface);
+  }
 
 /* ---------------------------------------------------------------
    Footer / latency panel
@@ -349,4 +398,55 @@ body {
   text-align: right;
   color: var(--text);
   font-variant-numeric: tabular-nums;
+}
+
+/* ---------------------------------------------------------------
+   Avatar
+   --------------------------------------------------------------- */
+
+.sarjy{--c:185,138,61;--lvl:0;--px:0;--py:0;position:relative;width:min(260px,70vw);aspect-ratio:1;display:grid;place-items:center;isolation:isolate;transition:filter .6s}
+.sarjy *{box-sizing:border-box}
+.sarjy-l{position:absolute;inset:0;border-radius:50%;pointer-events:none}
+.sarjy-aura{inset:-30%;background:radial-gradient(circle,rgba(var(--c),.35) 0%,rgba(var(--c),.12) 35%,transparent 65%);filter:blur(18px);transform:translate(calc(var(--px)*-6px),calc(var(--py)*-6px)) scale(calc(1 + var(--lvl)*.25));opacity:calc(.7 + var(--lvl)*.3);transition:background .8s}
+.sarjy-float{position:absolute;inset:0;animation:sarjy-float 6s ease-in-out infinite}
+.sarjy-ring{inset:4%;transform:translate(calc(var(--px)*4px),calc(var(--py)*4px))}
+.sarjy-ring svg{width:100%;height:100%;overflow:visible}
+.sarjy-ring .r1{transform-origin:50% 50%;animation:sarjy-spin 40s linear infinite}
+.sarjy-ring .r2{transform-origin:50% 50%;animation:sarjy-spin 26s linear infinite reverse}
+.sarjy-core{inset:22%;border-radius:var(--shape,50%);transform:translate(calc(var(--px)*10px),calc(var(--py)*10px)) scale(calc(1 + var(--lvl)*var(--gain,.12)));background:radial-gradient(circle at 38% 32%,rgba(255,248,230,.95) 0%,rgba(var(--c),.95) 22%,rgba(var(--c),.55) 52%,rgba(20,20,15,.9) 100%);box-shadow:0 0 calc(30px + var(--lvl)*50px) rgba(var(--c),.55),inset 0 0 30px rgba(20,20,15,.6);transition:background .8s,box-shadow .3s,border-radius .25s;overflow:hidden}
+.sarjy-inner{position:absolute;inset:-20%;background:conic-gradient(from 0deg,transparent 0 15%,rgba(255,248,230,.25) 20%,transparent 30% 55%,rgba(var(--c),.6) 62%,transparent 72%);mix-blend-mode:screen;opacity:.35;animation:sarjy-spin 18s linear infinite;transition:opacity .8s}
+.sarjy-grid{position:absolute;inset:0;border-radius:50%;background:repeating-radial-gradient(circle at 50% 50%,transparent 0 6px,rgba(255,248,230,.07) 6px 7px);opacity:0;transition:opacity .8s}
+.sarjy-spec{inset:30% 44% 52% 32%;background:radial-gradient(ellipse,rgba(255,255,255,.8),transparent 70%);filter:blur(4px);transform:translate(calc(var(--px)*14px),calc(var(--py)*14px))}
+.sarjy-ripple{inset:22%;border:1.5px solid rgba(var(--c),.8);opacity:0}
+.sarjy-shadow{inset:auto 25% -14% 25%;height:10%;background:radial-gradient(ellipse,rgba(var(--c),.3),transparent 70%);filter:blur(8px);animation:sarjy-shadow 6s ease-in-out infinite}
+.sarjy-label{position:absolute;bottom:-16%;left:0;right:0;text-align:center;font:500 11px/1 Inter,system-ui,sans-serif;letter-spacing:.28em;text-transform:uppercase;color:#a6a293}
+.sarjy-label b{font:400 15px/1 Fraunces,serif;letter-spacing:0;text-transform:none;color:#f3f1e8;margin-right:8px}
+
+/* states */
+.sarjy[data-s=idle] .sarjy-core{animation:sarjy-breathe 5s ease-in-out infinite}
+.sarjy[data-s=listening]{--gain:.22}
+.sarjy[data-s=listening] .sarjy-ring .r1{animation-duration:14s}
+.sarjy[data-s=thinking] .sarjy-inner,.sarjy[data-s=transcribing] .sarjy-inner{opacity:.85;animation-duration:4s}
+.sarjy[data-s=thinking] .sarjy-grid,.sarjy[data-s=transcribing] .sarjy-grid{opacity:1;animation:sarjy-scan 3s ease-in-out infinite}
+.sarjy[data-s=thinking] .sarjy-ring .r2,.sarjy[data-s=transcribing] .sarjy-ring .r2{animation-duration:5s}
+.sarjy[data-s=transcribing] .sarjy-ring .r1{animation-duration:8s}
+.sarjy[data-s=speaking]{--gain:.16}
+.sarjy[data-s=speaking] .sarjy-ripple{animation:sarjy-ripple 1.6s cubic-bezier(.2,.6,.3,1) infinite}
+.sarjy[data-s=speaking] .sarjy-ripple.d2{animation-delay:.53s}
+.sarjy[data-s=speaking] .sarjy-ripple.d3{animation-delay:1.06s}
+.sarjy[data-s=error] .sarjy-float{animation:sarjy-shudder .5s linear}
+.sarjy[data-s=error]{filter:brightness(1.3)}
+
+@keyframes sarjy-spin{to{transform:rotate(360deg)}}
+@keyframes sarjy-float{0%,100%{transform:translateY(-4%)}50%{transform:translateY(3%)}}
+@keyframes sarjy-shadow{0%,100%{transform:scale(.8);opacity:.6}50%{transform:scale(1.05);opacity:1}}
+@keyframes sarjy-breathe{0%,100%{filter:brightness(.9)}50%{filter:brightness(1.15)}}
+@keyframes sarjy-scan{0%,100%{transform:scale(.9)}50%{transform:scale(1.1)}}
+@keyframes sarjy-ripple{0%{transform:scale(1);opacity:calc(.3 + var(--lvl)*.7)}100%{transform:scale(calc(1.5 + var(--lvl)*.9));opacity:0}}
+@keyframes sarjy-shudder{0%,100%{transform:translateX(0)}20%{transform:translateX(-5%)}40%{transform:translateX(4%)}60%{transform:translateX(-3%)}80%{transform:translateX(2%)}}
+
+@media (prefers-reduced-motion: reduce){
+  .sarjy *,.sarjy{animation:none!important}
+  .sarjy-core,.sarjy-aura,.sarjy-ring,.sarjy-spec{transform:none!important}
+  .sarjy-core{transition:background .6s,box-shadow .6s}
 }

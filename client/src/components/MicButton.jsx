@@ -1,3 +1,5 @@
+import SarjyAvatar from "./SarjyAvatar";
+
 export function MicButton({ state, onStart, onStop }) {
   const label = {
     idle: "Talk to Sarjy",
@@ -15,16 +17,8 @@ export function MicButton({ state, onStart, onStop }) {
   const disabled = state === "transcribing" || state === "thinking" || state === "speaking";
 
   return (
-    <div className="mic-wrap">
-      <button
-        className={`mic-orb mic-orb--${state}`}
-        onClick={handleClick}
-        disabled={disabled}
-        aria-label={label}
-      >
-        <span className="mic-orb__ring" />
-        <span className="mic-orb__core" />
-      </button>
+    <div className="mic-wrap"  onClick={handleClick}>
+      <SarjyAvatar state={state} audioLevel={0.7} />
       <p className="mic-label">{label}</p>
     </div>
   );
