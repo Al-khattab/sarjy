@@ -11,6 +11,9 @@ export default function App() {
     errorText,
     timings,
     ttfa,
+    ttsProvider,
+    setTtsProvider,
+    ttsDebug,
     startListening,
     stopListening,
     sendTextFallback,
@@ -67,6 +70,29 @@ export default function App() {
           <Transcript messages={messages} />
         </div>
       </main>
+
+      <div className="tts-toggle">
+        <span>Voice:</span>
+        <button
+          className={ttsProvider === "browser" ? "active" : ""}
+          onClick={() => setTtsProvider("browser")}
+        >
+          Browser
+        </button>
+        <button
+          className={ttsProvider === "groq" ? "active" : ""}
+          onClick={() => setTtsProvider("groq")}
+        >
+          Groq
+        </button>
+        {ttsDebug && (
+          <span className="tts-debug">
+            {ttsDebug.provider}: {ttsDebug.roundTripMs}ms round trip
+            {ttsDebug.synthesisMs != null &&
+              ` (${ttsDebug.synthesisMs}ms synthesis)`}
+          </span>
+        )}
+      </div>
 
       <footer className="footer">
         <LatencyPanel timings={timings} ttfa={ttfa} />

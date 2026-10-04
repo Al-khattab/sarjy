@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 
 /**
  * Returns a stable, anonymous per-browser user id, creating and persisting one
@@ -24,7 +24,15 @@ function getUserId() {
  * - `listening`: microphone is recording.
  * - `transcribing`: audio is being sent to `/api/transcribe`.
  * - `thinking`: waiting for / streaming the LLM reply from `/api/chat`.
- * - `speaking`: one or more sentences are queued/playing via `speechSynthesis`.
+ * - `speaking`: one or more sentences are queued/playing via the selected TTS provider.
+ */
+
+/**
+ * @typedef {"browser" | "groq"} TtsProvider
+ * - `browser`: the Web Speech API's `speechSynthesis` — zero network cost,
+ *   synthesis happens locally on the user's device.
+ * - `groq`: `/api/speak`, which calls Groq's TTS endpoint and returns audio
+ *   bytes — a real network + inference round trip per sentence.
  */
 
 /**
@@ -40,9 +48,22 @@ function getUserId() {
  * name — these come straight from the server's `timing` SSE events
  * (`{ name, ms }`) and are not compared against the client's own clock, to
  * avoid cross-machine clock-skew error. Available keys depend on whether a
- * tool call happened this turn (see chat.js).
- * @property {number} [key] e.g. memory_loaded, llm_first_token, tool_result,
- *   llm_first_token_after_tool, llm_done.
+ * tool call happened this turn (see server/src/routes/chat.js).
+ * @property {number} [key] e.g. memory_loaded, llm_first_token, tool_call_detected,
+ *   tool_result, llm_first_token_after_tool, llm_done.
+ */
+
+/**
+ * @typedef {Object} TtsDebug
+ * Comparison data for whichever TTS provider produced the most recent turn's
+ * first spoken sentence — lets the latency panel show "browser: 0ms" vs.
+ * "groq: 340ms round trip (210ms synthesis)" side by side across turns.
+ * @property {TtsProvider} provider Which provider produced this turn's audio.
+ * @property {number} roundTripMs Client-measured fetch-to-first-audio time.
+ *   Always 0 for `browser`, since there's no network call to measure.
+ * @property {number | null} synthesisMs Server-reported pure synthesis time
+ *   (from the `X-Synthesis-Ms` response header), isolating Groq's own
+ *   processing time from network transit. `null` for `browser`.
  */
 
 /**
@@ -58,6 +79,12 @@ function getUserId() {
  *   utterance actually starting. This is the headline "did it feel fast"
  *   number — it accounts for STT + chat + speech synthesis start, not just
  *   the LLM's first token.
+ * @property {TtsProvider} ttsProvider Which TTS provider new turns will use.
+ * @property {(provider: TtsProvider) => void} setTtsProvider Switches the
+ *   TTS provider for the *next* turn. Mid-turn changes don't affect audio
+ *   already queued — each turn pins the provider it started with.
+ * @property {TtsDebug | null} ttsDebug Comparison timing for the latest
+ *   turn's TTS provider.
  * @property {() => Promise<void>} startListening Requests the mic and begins recording.
  * @property {() => void} stopListening Stops recording, which triggers transcription
  *   and the rest of the turn.
@@ -77,10 +104,18 @@ function getUserId() {
  * 2. **Transcribe**: POSTs the audio to `/api/transcribe` (expects `{ text }`).
  * 3. **Think + Speak**: POSTs the text to `/api/chat` and reads a
  *    Server-Sent Events stream (`token`, `timing`, `error` events). As soon
- *    as a complete sentence has streamed in, it's queued to
- *    `speechSynthesis` immediately — we don't wait for the full reply
- *    before speaking starts, which is the main lever for perceived latency
- *    now that TTS is local instead of a network call.
+ *    as a complete sentence has streamed in, it's queued to speech
+ *    immediately via whichever provider (`browser` or `groq`) was selected
+ *    when the turn started — we don't wait for the full reply to finish
+ *    before speaking starts.
+ *
+ * Two TTS providers are supported:
+ * - `browser` (`speechSynthesis`): queues natively, zero network cost per
+ *   sentence, synthesis happens on-device.
+ * - `groq` (`/api/speak`): no native queue, so a small serial queue
+ *   (`groqQueueRef`/`groqPlayingRef`) plays one `<audio>` element at a time
+ *   in order, fetching and decoding each sentence's audio as a real network
+ *   round trip.
  *
  * Errors surface through `errorText` and return the state to `idle`, so the
  * next mic press always starts a fresh turn.
@@ -112,6 +147,10 @@ export function useVoiceChat() {
   const [timings, setTimings] = useState(null);
   /** @type {[number | null, Function]} */
   const [ttfa, setTtfa] = useState(null);
+  /** @type {[TtsProvider, Function]} */
+  const [ttsProvider, setTtsProvider] = useState("browser");
+  /** @type {[TtsDebug | null, Function]} */
+  const [ttsDebug, setTtsDebug] = useState(null);
 
   /** @type {React.MutableRefObject<MediaRecorder | null>} Active recorder. */
   const mediaRecorderRef = useRef(null);
@@ -124,44 +163,141 @@ export function useVoiceChat() {
   const recordingStoppedAt = useRef(0);
 
   /**
-   * Speaks one sentence via the browser's `speechSynthesis`. Calling this
-   * repeatedly queues utterances in order — `speechSynthesis` plays them
-   * back to back, so sentences can be handed off as they stream in rather
-   * than waiting for the whole reply.
+   * Mirrors `ttsProvider` into a ref so the async, long-running `sendToChat`
+   * loop always reads the provider that was selected when a given turn
+   * started, even if the user flips the toggle mid-reply. Reading state
+   * directly inside that loop would instead pick up whatever the *latest*
+   * render set, which could switch providers mid-turn.
+   */
+  const ttsProviderRef = useRef(ttsProvider);
+  useEffect(() => {
+    ttsProviderRef.current = ttsProvider;
+  }, [ttsProvider]);
+
+  /** @type {React.MutableRefObject<string[]>} Pending sentences for the Groq TTS queue. */
+  const groqQueueRef = useRef([]);
+  /** @type {React.MutableRefObject<boolean>} Whether a Groq `<audio>` element is currently playing. */
+  const groqPlayingRef = useRef(false);
+
+  /**
+   * Plays the next queued sentence through `/api/speak` (Groq TTS), one at a
+   * time, in order. `speechSynthesis` queues utterances natively; `<audio>`
+   * elements don't, so this provides the same ordering guarantee manually.
    *
-   * The FIRST utterance of a turn marks `ttfa` on its `onstart` event (the
-   * moment sound actually begins), and `state` returns to `idle` once the
-   * LAST queued utterance for the turn finishes.
+   * Marks `ttfa`/`ttsDebug` on the turn's first utterance's `onplay` event —
+   * mirroring how the browser path marks on `onstart` — and keeps draining
+   * the queue until it's empty and no utterances are still pending.
+   *
+   * @param {{ isFirst: boolean }} flags Mutated in place; shared across a turn.
+   * @param {React.MutableRefObject<number>} pendingRef Count of utterances
+   *   still queued/playing for this turn, shared across both providers.
+   * @returns {Promise<void>}
+   */
+  const drainGroqQueue = useCallback(async (flags, pendingRef) => {
+    if (groqPlayingRef.current) return;
+    const text = groqQueueRef.current.shift();
+    if (!text) return;
+    groqPlayingRef.current = true;
+
+    const fetchStart = performance.now();
+    try {
+      const res = await fetch("/api/speak", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ text }),
+      });
+      if (!res.ok) throw new Error("TTS request failed");
+      const synthesisMs = res.headers.get("X-Synthesis-Ms");
+      const blob = await res.blob();
+      const url = URL.createObjectURL(blob);
+      const audio = new Audio(url);
+
+      await new Promise((resolve) => {
+        audio.onplay = () => {
+          if (flags.isFirst) {
+            flags.isFirst = false;
+            setState("speaking");
+            setTtfa(performance.now() - recordingStoppedAt.current);
+            setTtsDebug({
+              provider: "groq",
+              roundTripMs: Math.round(performance.now() - fetchStart),
+              synthesisMs: synthesisMs ? Number(synthesisMs) : null,
+            });
+          }
+        };
+        const settle = () => {
+          URL.revokeObjectURL(url);
+          resolve();
+        };
+        audio.onended = settle;
+        audio.onerror = settle;
+        audio.play().catch(settle);
+      });
+    } catch (err) {
+      console.error("[sarjy] Groq TTS playback failed:", err);
+    } finally {
+      pendingRef.current -= 1;
+      groqPlayingRef.current = false;
+      if (pendingRef.current <= 0 && groqQueueRef.current.length === 0) {
+        setState("idle");
+      } else {
+        drainGroqQueue(flags, pendingRef);
+      }
+    }
+  }, []);
+
+  /**
+   * Queues one sentence for speech via whichever provider was pinned for
+   * this turn. Dispatches to {@link drainGroqQueue} for `"groq"`, or speaks
+   * immediately via `speechSynthesis` for `"browser"` (which queues
+   * utterances natively, so no manual queue is needed on that path).
+   *
+   * The FIRST utterance of a turn marks `ttfa`/`ttsDebug` on the moment
+   * sound actually begins (`onstart` for browser, `onplay` for Groq), and
+   * `state` returns to `idle` once the LAST queued utterance for the turn
+   * finishes, across either provider.
    *
    * @param {string} text Sentence to speak.
-   * @param {{ isFirst: boolean }} flags Whether this is the turn's first utterance.
+   * @param {{ isFirst: boolean }} flags Mutated in place; shared across a turn.
    * @param {React.MutableRefObject<number>} pendingRef Count of utterances
    *   still queued/playing for this turn, shared across calls.
+   * @param {TtsProvider} provider Provider pinned for this turn.
    */
-  const speakSentence = useCallback((text, flags, pendingRef) => {
-    const trimmed = text.trim();
-    if (!trimmed) return;
+  const speakSentence = useCallback(
+    (text, flags, pendingRef, provider) => {
+      const trimmed = text.trim();
+      if (!trimmed) return;
+      pendingRef.current += 1;
 
-    const utter = new SpeechSynthesisUtterance(trimmed);
-    pendingRef.current += 1;
+      if (provider === "groq") {
+        groqQueueRef.current.push(trimmed);
+        drainGroqQueue(flags, pendingRef);
+        return;
+      }
 
-    if (flags.isFirst) {
-      flags.isFirst = false;
-      utter.onstart = () => {
-        setState("speaking");
-        setTtfa(performance.now() - recordingStoppedAt.current);
+      const utter = new SpeechSynthesisUtterance(trimmed);
+      if (flags.isFirst) {
+        flags.isFirst = false;
+        utter.onstart = () => {
+          setState("speaking");
+          setTtfa(performance.now() - recordingStoppedAt.current);
+          setTtsDebug({
+            provider: "browser",
+            roundTripMs: 0,
+            synthesisMs: null,
+          });
+        };
+      }
+      const onSettled = () => {
+        pendingRef.current -= 1;
+        if (pendingRef.current <= 0) setState("idle");
       };
-    }
-
-    const onSettled = () => {
-      pendingRef.current -= 1;
-      if (pendingRef.current <= 0) setState("idle");
-    };
-    utter.onend = onSettled;
-    utter.onerror = onSettled;
-
-    window.speechSynthesis.speak(utter);
-  }, []);
+      utter.onend = onSettled;
+      utter.onerror = onSettled;
+      window.speechSynthesis.speak(utter);
+    },
+    [drainGroqQueue]
+  );
 
   /**
    * Sends user text to `/api/chat` and streams the reply. As sentence
@@ -169,6 +305,11 @@ export function useVoiceChat() {
    * queued to speech via {@link speakSentence} instead of waiting for the
    * full reply to finish — this is what makes the assistant start talking
    * mid-generation rather than after a full pause.
+   *
+   * The TTS provider is read ONCE at the start of the turn (via
+   * `ttsProviderRef`) and reused for every sentence in that turn, even if
+   * the user flips the toggle before the turn finishes — avoids a reply
+   * switching providers mid-sentence.
    *
    * SSE events handled:
    * - `timing`: `{ name: string, ms: number }` — server-relative duration,
@@ -194,7 +335,9 @@ export function useVoiceChat() {
       setMessages((m) => [...m, { role: "user", content: userText }]);
       setMessages((m) => [...m, { role: "assistant", content: "" }]);
       setTtfa(null);
+      setTtsDebug(null);
       const localTimings = {};
+      const provider = ttsProviderRef.current; // pinned for the whole turn
 
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -254,7 +397,12 @@ export function useVoiceChat() {
             });
 
             if (/[.!?]$/.test(sentenceBuffer.trim())) {
-              speakSentence(sentenceBuffer, speakFlags, pendingUtterances);
+              speakSentence(
+                sentenceBuffer,
+                speakFlags,
+                pendingUtterances,
+                provider
+              );
               sentenceBuffer = "";
             }
           } else if (event === "error") {
@@ -264,7 +412,7 @@ export function useVoiceChat() {
       }
 
       if (sentenceBuffer.trim()) {
-        speakSentence(sentenceBuffer, speakFlags, pendingUtterances);
+        speakSentence(sentenceBuffer, speakFlags, pendingUtterances, provider);
       } else if (pendingUtterances.current === 0) {
         // Nothing was ever queued (empty/failed reply) — don't get stuck in "thinking".
         setState("idle");
@@ -305,7 +453,10 @@ export function useVoiceChat() {
         form.append("audio", blob, "audio.webm");
 
         try {
-          const res = await fetch("/api/transcribe", { method: "POST", body: form });
+          const res = await fetch("/api/transcribe", {
+            method: "POST",
+            body: form,
+          });
           const data = await res.json();
           if (!res.ok || !data.text) {
             setErrorText("Didn't catch that — mind trying again?");
@@ -377,6 +528,9 @@ export function useVoiceChat() {
     errorText,
     timings,
     ttfa,
+    ttsProvider,
+    setTtsProvider,
+    ttsDebug,
     startListening,
     stopListening,
     sendTextFallback,
