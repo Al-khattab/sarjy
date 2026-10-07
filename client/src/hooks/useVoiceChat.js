@@ -207,6 +207,26 @@ export function useVoiceChat() {
   }, []);
 
   /**
+   * Immediately stops whatever's currently happening and forces state back to
+   * "idle" directly — cancels queued/playing browser speech, pauses the
+   * current Groq `<audio>`, clears the Groq queue, stops any in-progress
+   * recording, and tears down VAD.
+   */
+  const interruptCurrentTurn = useCallback(() => {
+    window.speechSynthesis.cancel();
+    if (currentGroqAudioRef.current) {
+      currentGroqAudioRef.current.pause();
+      currentGroqAudioRef.current = null;
+    }
+    groqQueueRef.current = [];
+    groqPlayingRef.current = false;
+    safeStopRecorder();
+    stopVad();
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+    setState("idle");
+  }, [safeStopRecorder, stopVad]);
+
+  /**
    * Watches mic volume on an animation-frame loop and calls `safeStopRecorder`
    * once ~`SILENCE_DURATION_MS` of quiet follows at least `MIN_SPEECH_MS` of
    * detected speech. This is what makes recording stop without a button
@@ -587,21 +607,12 @@ export function useVoiceChat() {
    * Ends the hands-free session and immediately silences whatever's
    * playing — cancels queued/playing browser speech, pauses the current
    * Groq `<audio>` if one is playing, stops any in-progress recording, and
-   * tears down the VAD loop. Does NOT clear the conversation transcript.
+   * tears down the VAD loop.
    */
   const endConversation = useCallback(() => {
     setHandsFree(false);
-    window.speechSynthesis.cancel();
-    if (currentGroqAudioRef.current) {
-      currentGroqAudioRef.current.pause();
-      currentGroqAudioRef.current = null;
-    }
-    groqQueueRef.current = [];
-    safeStopRecorder();
-    stopVad();
-    micStreamRef.current?.getTracks().forEach((t) => t.stop());
-    setState("idle");
-  }, [safeStopRecorder, stopVad]);
+    interruptCurrentTurn();
+  }, [interruptCurrentTurn]);
 
   /**
    * Text-input alternative to the mic. Works whether or not a hands-free
@@ -619,18 +630,35 @@ export function useVoiceChat() {
   );
 
   /**
-   * Requests server-side deletion of this user's stored data and clears the
-   * local conversation.
+   * Interrupts whatever's currently playing/recording, clears the local
+   * conversation and debug state, then asks the server to delete this user's
+   * stored data. If a hands-free session was running, listening resumes
+   * automatically afterward — a hands-free user shouldn't need an extra tap
+   * just to keep going after a "start fresh" action. Remove the last line if
+   * you'd rather it pause and wait for an explicit tap instead.
    *
    * @returns {Promise<void>}
    */
   const forgetMe = useCallback(async () => {
-    await fetch("/api/forget-me", {
-      method: "POST",
-      headers: { "x-user-id": userId.current },
-    });
+    interruptCurrentTurn();
     setMessages([]);
-  }, []);
+    setTimings(null);
+    setTtfa(null);
+    setTtsDebug(null);
+    setErrorText(null);
+    
+
+    try {
+      await fetch("/api/forget-me", {
+        method: "POST",
+        headers: { "x-user-id": userId.current },
+      });
+    } catch (err) {
+      console.error("[sarjy] forget-me request failed:", err);
+    }
+
+    // if (handsFreeRef.current) continueIfHandsFree();
+  }, [interruptCurrentTurn, continueIfHandsFree]);
 
   // Make sure a page navigation/unmount can't leave the mic or VAD running.
   useEffect(() => {
@@ -654,7 +682,7 @@ export function useVoiceChat() {
     ttsDebug,
     startConversation,
     endConversation,
-    startListening,                 
+    startListening,
     stopListening: safeStopRecorder,
     sendTextFallback,
     forgetMe,

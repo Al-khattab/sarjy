@@ -30,7 +30,7 @@ export default function App() {
   return (
     <div className="page">
       <header className="header">
-        <span className="wordmark">سرج · Sarjy</span>
+        <span className="wordmark">Sarjy</span>
         <button className="forget-link" onClick={forgetMe}>
           Forget me
         </button>
