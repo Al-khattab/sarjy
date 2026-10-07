@@ -17,11 +17,24 @@ function getUserId() {
   return id;
 }
 
+// --- Voice Activity Detection tuning ---------------------------------
+// RMS of the mic's time-domain signal, 0-1. These are starting points, not
+// guarantees — mic sensitivity and room noise vary a lot.
+const SPEECH_RMS_THRESHOLD = 0.01; // above this = "someone is talking"
+const SILENCE_RMS_THRESHOLD = 0.012; // below this = "quiet"
+const SILENCE_DURATION_MS = 900; // this much continuous quiet = turn is over
+const MIN_SPEECH_MS = 300; // ignore blips shorter than this (coughs, clicks)
+const MAX_RECORDING_MS = 20000; // hard cap if silence is never detected
+const RELISTEN_DELAY_MS = 400; // pause after Sarjy stops talking before
+// listening again — gives speaker audio a moment to fully decay before the
+// mic reopens, reducing (not eliminating) Sarjy hearing it own voice.
+
 /**
  * @typedef {"idle" | "listening" | "transcribing" | "thinking" | "speaking"} VoiceState
  * Current phase of the voice turn.
- * - `idle`: waiting for the user.
- * - `listening`: microphone is recording.
+ * - `idle`: no active turn. In hands-free mode this is a transient state
+ *   between turns, not a resting state the user has to act from.
+ * - `listening`: microphone is open; VAD is watching for silence to auto-stop.
  * - `transcribing`: audio is being sent to `/api/transcribe`.
  * - `thinking`: waiting for / streaming the LLM reply from `/api/chat`.
  * - `speaking`: one or more sentences are queued/playing via the selected TTS provider.
@@ -47,98 +60,81 @@ function getUserId() {
  * Milliseconds SINCE THE SERVER RECEIVED THE REQUEST, keyed by checkpoint
  * name — these come straight from the server's `timing` SSE events
  * (`{ name, ms }`) and are not compared against the client's own clock, to
- * avoid cross-machine clock-skew error. Available keys depend on whether a
- * tool call happened this turn (see server/src/routes/chat.js).
+ * avoid cross-machine clock-skew error.
  * @property {number} [key] e.g. memory_loaded, llm_first_token, tool_call_detected,
  *   tool_result, llm_first_token_after_tool, llm_done.
  */
 
 /**
  * @typedef {Object} TtsDebug
- * Comparison data for whichever TTS provider produced the most recent turn's
- * first spoken sentence — lets the latency panel show "browser: 0ms" vs.
- * "groq: 340ms round trip (210ms synthesis)" side by side across turns.
  * @property {TtsProvider} provider Which provider produced this turn's audio.
  * @property {number} roundTripMs Client-measured fetch-to-first-audio time.
- *   Always 0 for `browser`, since there's no network call to measure.
+ *   Always 0 for `browser`.
  * @property {number | null} synthesisMs Server-reported pure synthesis time
- *   (from the `X-Synthesis-Ms` response header), isolating Groq's own
- *   processing time from network transit. `null` for `browser`.
+ *   (from `X-Synthesis-Ms`). `null` for `browser`.
  */
 
 /**
  * @typedef {Object} UseVoiceChatResult
  * @property {VoiceState} state Current phase of the voice turn.
+ * @property {boolean} handsFree Whether a hands-free session is active —
+ *   while true, the hook auto-chains listening after every turn.
  * @property {ChatMessage[]} messages Conversation history, oldest first.
  * @property {string | null} errorText User-facing error message, or `null`.
- *   Cleared when listening starts.
  * @property {TurnTimings | null} timings Server-reported latency checkpoints
- *   for the latest turn, relative to that request's start.
+ *   for the latest turn.
  * @property {number | null} ttfa Time-to-first-audible-word for the latest
- *   turn, in ms, measured client-side from mic-release to the first spoken
- *   utterance actually starting. This is the headline "did it feel fast"
- *   number — it accounts for STT + chat + speech synthesis start, not just
- *   the LLM's first token.
+ *   turn, in ms, from mic-release/VAD-stop to the first spoken utterance
+ *   actually starting.
  * @property {TtsProvider} ttsProvider Which TTS provider new turns will use.
- * @property {(provider: TtsProvider) => void} setTtsProvider Switches the
- *   TTS provider for the *next* turn. Mid-turn changes don't affect audio
- *   already queued — each turn pins the provider it started with.
- * @property {TtsDebug | null} ttsDebug Comparison timing for the latest
- *   turn's TTS provider.
- * @property {() => Promise<void>} startListening Requests the mic and begins recording.
- * @property {() => void} stopListening Stops recording, which triggers transcription
- *   and the rest of the turn.
- * @property {(text: string) => void} sendTextFallback Sends typed text through the
- *   same chat -> speak pipeline, bypassing the microphone.
- * @property {() => Promise<void>} forgetMe Asks the server to delete this user's
- *   stored data and clears local messages.
+ * @property {(provider: TtsProvider) => void} setTtsProvider
+ * @property {TtsDebug | null} ttsDebug Comparison timing for the latest turn.
+ * @property {() => Promise<void>} startConversation Requests the mic and
+ *   begins a hands-free session: listen -> respond -> listen again,
+ *   automatically, until `endConversation` is called.
+ * @property {() => void} endConversation Ends the hands-free session,
+ *   immediately stops any in-progress recording or playback, and returns
+ *   to `idle`.
+ * @property {(text: string) => void} sendTextFallback Sends typed text through
+ *   the same chat -> speak pipeline, bypassing the microphone. Works whether
+ *   or not a hands-free session is active.
+ * @property {() => Promise<void>} forgetMe Asks the server to delete this
+ *   user's stored data and clears local messages.
  */
 
 /**
- * React hook that drives a push-to-talk voice assistant.
+ * React hook that drives a hands-free voice assistant.
  *
- * Turn pipeline:
- * `idle -> listening -> transcribing -> thinking -> speaking -> idle`
+ * `startConversation()` is the one required user gesture (browsers won't
+ * grant mic access without one). After that, the turn pipeline repeats on
+ * its own with no further taps:
  *
- * 1. **Listen**: records mic audio with `MediaRecorder`.
- * 2. **Transcribe**: POSTs the audio to `/api/transcribe` (expects `{ text }`).
- * 3. **Think + Speak**: POSTs the text to `/api/chat` and reads a
- *    Server-Sent Events stream (`token`, `timing`, `error` events). As soon
- *    as a complete sentence has streamed in, it's queued to speech
- *    immediately via whichever provider (`browser` or `groq`) was selected
- *    when the turn started — we don't wait for the full reply to finish
- *    before speaking starts.
+ * `listening (VAD watches for silence) -> transcribing -> thinking -> speaking -> listening -> ...`
  *
- * Two TTS providers are supported:
- * - `browser` (`speechSynthesis`): queues natively, zero network cost per
- *   sentence, synthesis happens on-device.
- * - `groq` (`/api/speak`): no native queue, so a small serial queue
- *   (`groqQueueRef`/`groqPlayingRef`) plays one `<audio>` element at a time
- *   in order, fetching and decoding each sentence's audio as a real network
- *   round trip.
+ * VAD (see the tuning constants above the typedefs) replaces manual
+ * start/stop: a `Web Audio` `AnalyserNode` reads mic volume on an animation
+ * frame loop, and recording auto-stops once ~900ms of silence follows
+ * detected speech, or after `MAX_RECORDING_MS` regardless, whichever comes
+ * first — recording.state is always checked before calling `.stop()` since
+ * either path (or a manual `endConversation`) could fire first.
  *
- * Errors surface through `errorText` and return the state to `idle`, so the
- * next mic press always starts a fresh turn.
+ * Auto-chaining the next listen is done via explicit calls at each real
+ * "turn complete" point (end of TTS playback, or an empty/failed
+ * transcription), not by watching `state` in a `useEffect` — `state` passes
+ * through `idle` for reasons that aren't "ready for the next turn" too
+ * (initial mount, a manual stop), so a generic watcher would be unreliable.
  *
- * @example
- * function VoiceButton() {
- *   const { state, messages, errorText, startListening, stopListening } = useVoiceChat();
- *   return (
- *     <button
- *       onMouseDown={startListening}
- *       onMouseUp={stopListening}
- *       disabled={state !== "idle" && state !== "listening"}
- *     >
- *       {state}
- *     </button>
- *   );
- * }
+ * `endConversation()` immediately silences whatever's playing (cancels
+ * `speechSynthesis` and/or pauses the current Groq `<audio>`), not just the
+ * next listen — this matters a lot for how responsive it feels to exit.
  *
- * @returns {UseVoiceChatResult} State and actions for the voice chat UI.
+ * @returns {UseVoiceChatResult}
  */
 export function useVoiceChat() {
   /** @type {[VoiceState, Function]} */
   const [state, setState] = useState("idle");
+  /** @type {[boolean, Function]} */
+  const [handsFree, setHandsFree] = useState(false);
   /** @type {[ChatMessage[], Function]} */
   const [messages, setMessages] = useState([]);
   /** @type {[string | null, Function]} */
@@ -152,115 +148,222 @@ export function useVoiceChat() {
   /** @type {[TtsDebug | null, Function]} */
   const [ttsDebug, setTtsDebug] = useState(null);
 
-  /** @type {React.MutableRefObject<MediaRecorder | null>} Active recorder. */
-  const mediaRecorderRef = useRef(null);
-  /** @type {React.MutableRefObject<Blob[]>} Audio chunks for the current recording. */
-  const chunksRef = useRef([]);
-  /** @type {React.MutableRefObject<string>} Stable anonymous user id. */
   const userId = useRef(getUserId());
-  /** @type {React.MutableRefObject<number>} performance.now() when the mic
-   *  was released for the in-flight turn — the start point for TTFA. */
   const recordingStoppedAt = useRef(0);
 
-  /**
-   * Mirrors `ttsProvider` into a ref so the async, long-running `sendToChat`
-   * loop always reads the provider that was selected when a given turn
-   * started, even if the user flips the toggle mid-reply. Reading state
-   * directly inside that loop would instead pick up whatever the *latest*
-   * render set, which could switch providers mid-turn.
-   */
+  /** Mirrors `handsFree` so async callbacks always read the current value,
+   *  not whatever it was when that callback was created. */
+  const handsFreeRef = useRef(false);
+  useEffect(() => {
+    handsFreeRef.current = handsFree;
+  }, [handsFree]);
+
   const ttsProviderRef = useRef(ttsProvider);
   useEffect(() => {
     ttsProviderRef.current = ttsProvider;
   }, [ttsProvider]);
 
-  /** @type {React.MutableRefObject<string[]>} Pending sentences for the Groq TTS queue. */
+  // --- recording / VAD refs ---
+  const mediaRecorderRef = useRef(null);
+  const micStreamRef = useRef(null);
+  const chunksRef = useRef([]);
+  const audioCtxRef = useRef(null);
+  const analyserRef = useRef(null);
+  const vadRafRef = useRef(null);
+  const vadTimeoutRef = useRef(null);
+
+  // --- playback refs (so endConversation can interrupt immediately) ---
   const groqQueueRef = useRef([]);
-  /** @type {React.MutableRefObject<boolean>} Whether a Groq `<audio>` element is currently playing. */
   const groqPlayingRef = useRef(false);
+  const currentGroqAudioRef = useRef(null);
 
   /**
-   * Plays the next queued sentence through `/api/speak` (Groq TTS), one at a
-   * time, in order. `speechSynthesis` queues utterances natively; `<audio>`
-   * elements don't, so this provides the same ordering guarantee manually.
-   *
-   * Marks `ttfa`/`ttsDebug` on the turn's first utterance's `onplay` event —
-   * mirroring how the browser path marks on `onstart` — and keeps draining
-   * the queue until it's empty and no utterances are still pending.
-   *
-   * @param {{ isFirst: boolean }} flags Mutated in place; shared across a turn.
-   * @param {React.MutableRefObject<number>} pendingRef Count of utterances
-   *   still queued/playing for this turn, shared across both providers.
-   * @returns {Promise<void>}
+   * Stops the MediaRecorder exactly once, however it was triggered (VAD
+   * silence, the max-duration timeout, or a manual endConversation) —
+   * calling `.stop()` on an already-stopped recorder throws, so every
+   * trigger path goes through this guard instead of calling it directly.
    */
-  const drainGroqQueue = useCallback(async (flags, pendingRef) => {
-    if (groqPlayingRef.current) return;
-    const text = groqQueueRef.current.shift();
-    if (!text) return;
-    groqPlayingRef.current = true;
-
-    const fetchStart = performance.now();
-    try {
-      const res = await fetch("/api/speak", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
-      });
-      if (!res.ok) throw new Error("TTS request failed");
-      const synthesisMs = res.headers.get("X-Synthesis-Ms");
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
-
-      await new Promise((resolve) => {
-        audio.onplay = () => {
-          if (flags.isFirst) {
-            flags.isFirst = false;
-            setState("speaking");
-            setTtfa(performance.now() - recordingStoppedAt.current);
-            setTtsDebug({
-              provider: "groq",
-              roundTripMs: Math.round(performance.now() - fetchStart),
-              synthesisMs: synthesisMs ? Number(synthesisMs) : null,
-            });
-          }
-        };
-        const settle = () => {
-          URL.revokeObjectURL(url);
-          resolve();
-        };
-        audio.onended = settle;
-        audio.onerror = settle;
-        audio.play().catch(settle);
-      });
-    } catch (err) {
-      console.error("[sarjy] Groq TTS playback failed:", err);
-    } finally {
-      pendingRef.current -= 1;
-      groqPlayingRef.current = false;
-      if (pendingRef.current <= 0 && groqQueueRef.current.length === 0) {
-        setState("idle");
-      } else {
-        drainGroqQueue(flags, pendingRef);
-      }
+  const safeStopRecorder = useCallback(() => {
+    if (mediaRecorderRef.current?.state === "recording") {
+      mediaRecorderRef.current.stop();
     }
   }, []);
 
   /**
-   * Queues one sentence for speech via whichever provider was pinned for
-   * this turn. Dispatches to {@link drainGroqQueue} for `"groq"`, or speaks
-   * immediately via `speechSynthesis` for `"browser"` (which queues
-   * utterances natively, so no manual queue is needed on that path).
+   * Tears down the VAD animation loop and the AudioContext built for it.
+   * Called whenever a recording ends, by whatever means, so a stale loop
+   * never keeps running against a closed stream.
+   */
+  const stopVad = useCallback(() => {
+    if (vadRafRef.current) cancelAnimationFrame(vadRafRef.current);
+    vadRafRef.current = null;
+    if (vadTimeoutRef.current) clearTimeout(vadTimeoutRef.current);
+    vadTimeoutRef.current = null;
+    if (audioCtxRef.current) {
+      audioCtxRef.current.close().catch(() => {});
+      audioCtxRef.current = null;
+    }
+    analyserRef.current = null;
+  }, []);
+
+  /**
+   * Watches mic volume on an animation-frame loop and calls `safeStopRecorder`
+   * once ~`SILENCE_DURATION_MS` of quiet follows at least `MIN_SPEECH_MS` of
+   * detected speech. This is what makes recording stop without a button
+   * press. A separate `MAX_RECORDING_MS` timeout force-stops regardless, in
+   * case background noise means silence is never cleanly detected.
    *
-   * The FIRST utterance of a turn marks `ttfa`/`ttsDebug` on the moment
-   * sound actually begins (`onstart` for browser, `onplay` for Groq), and
-   * `state` returns to `idle` once the LAST queued utterance for the turn
-   * finishes, across either provider.
+   * @param {MediaStream} stream The mic stream also feeding the MediaRecorder.
+   */
+  const startVad = useCallback(
+    (stream) => {
+      const AudioContextCtor = window.AudioContext || window.webkitAudioContext;
+      const audioCtx = new AudioContextCtor();
+      const source = audioCtx.createMediaStreamSource(stream);
+      const analyser = audioCtx.createAnalyser();
+      analyser.fftSize = 512;
+      source.connect(analyser);
+      audioCtxRef.current = audioCtx;
+      analyserRef.current = analyser;
+
+      const data = new Uint8Array(analyser.fftSize);
+      let speechStartedAt = null;
+      let lastLoudAt = null;
+
+      const tick = () => {
+        analyser.getByteTimeDomainData(data);
+        let sumSquares = 0;
+        for (let i = 0; i < data.length; i++) {
+          const normalized = (data[i] - 128) / 128;
+          sumSquares += normalized * normalized;
+        }
+        const rms = Math.sqrt(sumSquares / data.length);
+        const now = performance.now();
+
+        if (rms > SPEECH_RMS_THRESHOLD) {
+          if (!speechStartedAt) speechStartedAt = now;
+          lastLoudAt = now;
+        }
+
+        const hasEnoughSpeech =
+          speechStartedAt && now - speechStartedAt >= MIN_SPEECH_MS;
+        const hasGoneQuiet =
+          rms < SILENCE_RMS_THRESHOLD &&
+          lastLoudAt &&
+          now - lastLoudAt >= SILENCE_DURATION_MS;
+
+        if (hasEnoughSpeech && hasGoneQuiet) {
+          safeStopRecorder();
+          return; // onstop handler takes over; no need to keep ticking
+        }
+
+        vadRafRef.current = requestAnimationFrame(tick);
+      };
+
+      vadRafRef.current = requestAnimationFrame(tick);
+      vadTimeoutRef.current = setTimeout(safeStopRecorder, MAX_RECORDING_MS);
+    },
+    [safeStopRecorder]
+  );
+
+  /**
+   * If a hands-free session is still active, waits a short beat (to let any
+   * just-finished speaker audio decay before the mic reopens) and then
+   * starts listening again. Called from every real "turn complete" point —
+   * never from a generic `state === "idle"` watcher, since idle also occurs
+   * for reasons that aren't "ready for the next turn."
+   */
+  const continueIfHandsFree = useCallback(() => {
+    if (!handsFreeRef.current) return;
+    setTimeout(() => {
+      if (handsFreeRef.current) startListeningRef.current?.();
+    }, RELISTEN_DELAY_MS);
+  }, []);
+
+  // startListening is defined below but referenced by continueIfHandsFree
+  // above it — a ref indirection avoids a circular useCallback dependency.
+  const startListeningRef = useRef(null);
+
+  /**
+   * Plays the next queued sentence through `/api/speak` (Groq TTS), one at a
+   * time, in order — `<audio>` elements don't queue themselves the way
+   * `speechSynthesis` does, so this provides that ordering manually.
+   * Chains back into listening via {@link continueIfHandsFree} once the
+   * queue is fully drained.
+   *
+   * @param {{ isFirst: boolean }} flags Mutated in place; shared across a turn.
+   * @param {React.MutableRefObject<number>} pendingRef Count of utterances
+   *   still queued/playing for this turn, shared across both providers.
+   */
+  const drainGroqQueue = useCallback(
+    async (flags, pendingRef) => {
+      if (groqPlayingRef.current) return;
+      const text = groqQueueRef.current.shift();
+      if (!text) return;
+      groqPlayingRef.current = true;
+
+      const fetchStart = performance.now();
+      try {
+        const res = await fetch("/api/speak", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        if (!res.ok) throw new Error("TTS request failed");
+        const synthesisMs = res.headers.get("X-Synthesis-Ms");
+        const blob = await res.blob();
+        const url = URL.createObjectURL(blob);
+        const audio = new Audio(url);
+        currentGroqAudioRef.current = audio;
+
+        await new Promise((resolve) => {
+          audio.onplay = () => {
+            if (flags.isFirst) {
+              flags.isFirst = false;
+              setState("speaking");
+              setTtfa(performance.now() - recordingStoppedAt.current);
+              setTtsDebug({
+                provider: "groq",
+                roundTripMs: Math.round(performance.now() - fetchStart),
+                synthesisMs: synthesisMs ? Number(synthesisMs) : null,
+              });
+            }
+          };
+          const settle = () => {
+            URL.revokeObjectURL(url);
+            if (currentGroqAudioRef.current === audio)
+              currentGroqAudioRef.current = null;
+            resolve();
+          };
+          audio.onended = settle;
+          audio.onerror = settle;
+          audio.play().catch(settle);
+        });
+      } catch (err) {
+        console.error("[sarjy] Groq TTS playback failed:", err);
+      } finally {
+        pendingRef.current -= 1;
+        groqPlayingRef.current = false;
+        if (pendingRef.current <= 0 && groqQueueRef.current.length === 0) {
+          setState("idle");
+          continueIfHandsFree();
+        } else {
+          drainGroqQueue(flags, pendingRef);
+        }
+      }
+    },
+    [continueIfHandsFree]
+  );
+
+  /**
+   * Queues one sentence for speech via whichever provider was pinned for
+   * this turn. The browser path chains back into listening (via
+   * {@link continueIfHandsFree}) once the LAST queued utterance finishes;
+   * the Groq path does the equivalent inside {@link drainGroqQueue}.
    *
    * @param {string} text Sentence to speak.
    * @param {{ isFirst: boolean }} flags Mutated in place; shared across a turn.
-   * @param {React.MutableRefObject<number>} pendingRef Count of utterances
-   *   still queued/playing for this turn, shared across calls.
+   * @param {React.MutableRefObject<number>} pendingRef
    * @param {TtsProvider} provider Provider pinned for this turn.
    */
   const speakSentence = useCallback(
@@ -290,43 +393,24 @@ export function useVoiceChat() {
       }
       const onSettled = () => {
         pendingRef.current -= 1;
-        if (pendingRef.current <= 0) setState("idle");
+        if (pendingRef.current <= 0) {
+          setState("idle");
+          continueIfHandsFree();
+        }
       };
       utter.onend = onSettled;
       utter.onerror = onSettled;
       window.speechSynthesis.speak(utter);
     },
-    [drainGroqQueue]
+    [drainGroqQueue, continueIfHandsFree]
   );
 
   /**
-   * Sends user text to `/api/chat` and streams the reply. As sentence
-   * boundaries appear in the streamed text, each sentence is immediately
-   * queued to speech via {@link speakSentence} instead of waiting for the
-   * full reply to finish — this is what makes the assistant start talking
-   * mid-generation rather than after a full pause.
+   * Sends user text to `/api/chat` and streams the reply, queuing each
+   * complete sentence to speech as it arrives rather than waiting for the
+   * full reply (see {@link speakSentence}).
    *
-   * The TTS provider is read ONCE at the start of the turn (via
-   * `ttsProviderRef`) and reused for every sentence in that turn, even if
-   * the user flips the toggle before the turn finishes — avoids a reply
-   * switching providers mid-sentence.
-   *
-   * SSE events handled:
-   * - `timing`: `{ name: string, ms: number }` — server-relative duration,
-   *   merged into `timings` as-is (see the {@link TurnTimings} typedef for
-   *   why this isn't compared against a client timestamp).
-   * - `token`: `{ text: string }`, appended to the assistant message and to
-   *   the sentence buffer.
-   * - `error`: `{ message: string }`, surfaced via `errorText`.
-   *
-   * Sentence splitting is a simple trailing-punctuation check (`.`, `!`,
-   * `?`). It'll occasionally split early on abbreviations or decimals
-   * ("Dr.", "3.5") — an acceptable trade-off for a take-home; a sentence
-   * tokenizer would be the fix with more time.
-   *
-   * On a non-OK response, sets `errorText` and returns to `idle`.
-   *
-   * @param {string} userText The user's transcribed or typed message.
+   * @param {string} userText
    * @returns {Promise<void>}
    */
   const sendToChat = useCallback(
@@ -337,7 +421,7 @@ export function useVoiceChat() {
       setTtfa(null);
       setTtsDebug(null);
       const localTimings = {};
-      const provider = ttsProviderRef.current; // pinned for the whole turn
+      const provider = ttsProviderRef.current;
 
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -351,6 +435,7 @@ export function useVoiceChat() {
       if (!res.ok || !res.body) {
         setErrorText("Sarjy couldn't respond just now. Try again?");
         setState("idle");
+        continueIfHandsFree();
         return;
       }
 
@@ -363,8 +448,6 @@ export function useVoiceChat() {
       const speakFlags = { isFirst: true };
       const pendingUtterances = { current: 0 };
 
-      // Minimal hand-rolled SSE parser — EventSource can't be used because
-      // it only supports GET requests, and we need to send a POST body.
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
@@ -372,7 +455,6 @@ export function useVoiceChat() {
           break;
         }
         buffer += decoder.decode(value, { stream: true });
-        // SSE frames are separated by a blank line; keep the trailing partial frame.
         const events = buffer.split("\n\n");
         buffer = events.pop() || "";
 
@@ -395,7 +477,6 @@ export function useVoiceChat() {
               copy[copy.length - 1] = { role: "assistant", content: full };
               return copy;
             });
-
             if (/[.!?]$/.test(sentenceBuffer.trim())) {
               speakSentence(
                 sentenceBuffer,
@@ -414,38 +495,43 @@ export function useVoiceChat() {
       if (sentenceBuffer.trim()) {
         speakSentence(sentenceBuffer, speakFlags, pendingUtterances, provider);
       } else if (pendingUtterances.current === 0) {
-        // Nothing was ever queued (empty/failed reply) — don't get stuck in "thinking".
+        // Empty/failed reply — nothing was queued to chain the next listen,
+        // so do it here instead.
         setState("idle");
+        continueIfHandsFree();
       }
     },
-    [speakSentence]
+    [speakSentence, continueIfHandsFree]
   );
 
   /**
-   * Requests microphone access and starts recording. On stop, uploads the audio
-   * to `/api/transcribe` and forwards the transcript to {@link sendToChat}.
+   * Opens the mic, starts recording, and starts the VAD loop watching it.
+   * Used both for the user's initial `startConversation()` tap and for
+   * every automatic re-listen {@link continueIfHandsFree} triggers.
    *
-   * Records `recordingStoppedAt` the moment the mic is released — this is
-   * the reference point `ttfa` is measured from, so it has to be captured
-   * here rather than later in the pipeline.
-   *
-   * Failure handling (all set `errorText` and return to `idle`):
-   * - mic permission denied / unavailable
-   * - empty or failed transcription
-   * - network error during transcription
+   * `echoCancellation`/`noiseSuppression`/`autoGainControl` are requested on
+   * the mic stream — helps (doesn't fully solve) the mic picking up Sarjy's
+   * own voice when played through speakers rather than headphones.
    *
    * @returns {Promise<void>}
    */
   const startListening = useCallback(async () => {
     setErrorText(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
+      micStreamRef.current = stream;
       const recorder = new MediaRecorder(stream);
       chunksRef.current = [];
       recorder.ondataavailable = (e) => chunksRef.current.push(e.data);
       recorder.onstop = async () => {
         recordingStoppedAt.current = performance.now();
-        // Release the mic so the browser's recording indicator turns off.
+        stopVad();
         stream.getTracks().forEach((t) => t.stop());
         setState("transcribing");
         const blob = new Blob(chunksRef.current, { type: "audio/webm" });
@@ -461,43 +547,68 @@ export function useVoiceChat() {
           if (!res.ok || !data.text) {
             setErrorText("Didn't catch that — mind trying again?");
             setState("idle");
+            continueIfHandsFree();
             return;
           }
           await sendToChat(data.text);
         } catch {
           setErrorText("Transcription failed — check your connection.");
           setState("idle");
+          continueIfHandsFree();
         }
       };
       recorder.start();
       mediaRecorderRef.current = recorder;
       setState("listening");
+      startVad(stream);
     } catch {
       setErrorText("Microphone access was denied. You can type instead below.");
+      setHandsFree(false); // permission issues won't resolve themselves — don't keep retrying
       setState("idle");
     }
-  }, [sendToChat]);
+  }, [sendToChat, startVad, stopVad, continueIfHandsFree]);
+
+  useEffect(() => {
+    startListeningRef.current = startListening;
+  }, [startListening]);
 
   /**
-   * Stops the active recording, which fires the recorder's `onstop` handler and
-   * begins transcription. No-op if nothing is recording.
+   * Begins a hands-free session: the one required user gesture for mic
+   * permission, after which turns chain automatically with no further taps.
    *
-   * @returns {void}
+   * @returns {Promise<void>}
    */
-  const stopListening = useCallback(() => {
-    mediaRecorderRef.current?.stop();
-  }, []);
+  const startConversation = useCallback(async () => {
+    setHandsFree(true);
+    await startListening();
+  }, [startListening]);
 
   /**
-   * Text-input alternative to the mic (e.g. when permission is denied or in
-   * noisy environments). Runs the same chat -> speak pipeline.
+   * Ends the hands-free session and immediately silences whatever's
+   * playing — cancels queued/playing browser speech, pauses the current
+   * Groq `<audio>` if one is playing, stops any in-progress recording, and
+   * tears down the VAD loop. Does NOT clear the conversation transcript.
+   */
+  const endConversation = useCallback(() => {
+    setHandsFree(false);
+    window.speechSynthesis.cancel();
+    if (currentGroqAudioRef.current) {
+      currentGroqAudioRef.current.pause();
+      currentGroqAudioRef.current = null;
+    }
+    groqQueueRef.current = [];
+    safeStopRecorder();
+    stopVad();
+    micStreamRef.current?.getTracks().forEach((t) => t.stop());
+    setState("idle");
+  }, [safeStopRecorder, stopVad]);
+
+  /**
+   * Text-input alternative to the mic. Works whether or not a hands-free
+   * session is active — if it is, the next listen still auto-chains once
+   * this reply finishes, same as a spoken turn would.
    *
-   * NOTE: `ttfa` will measure from "now" rather than from a mic release,
-   * since there's no recording step in this path — treat ttfa as
-   * voice-turn-only data when analyzing it.
-   *
-   * @param {string} text The message to send.
-   * @returns {void}
+   * @param {string} text
    */
   const sendTextFallback = useCallback(
     (text) => {
@@ -509,8 +620,7 @@ export function useVoiceChat() {
 
   /**
    * Requests server-side deletion of this user's stored data and clears the
-   * local conversation. Local messages are cleared even if the server
-   * responds with an error, since the response status is not checked.
+   * local conversation.
    *
    * @returns {Promise<void>}
    */
@@ -522,8 +632,19 @@ export function useVoiceChat() {
     setMessages([]);
   }, []);
 
+  // Make sure a page navigation/unmount can't leave the mic or VAD running.
+  useEffect(() => {
+    return () => {
+      safeStopRecorder();
+      stopVad();
+      micStreamRef.current?.getTracks().forEach((t) => t.stop());
+      window.speechSynthesis.cancel();
+    };
+  }, [safeStopRecorder, stopVad]);
+
   return {
     state,
+    handsFree,
     messages,
     errorText,
     timings,
@@ -531,8 +652,10 @@ export function useVoiceChat() {
     ttsProvider,
     setTtsProvider,
     ttsDebug,
-    startListening,
-    stopListening,
+    startConversation,
+    endConversation,
+    startListening,                 
+    stopListening: safeStopRecorder,
     sendTextFallback,
     forgetMe,
   };

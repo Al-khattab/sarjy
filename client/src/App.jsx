@@ -14,13 +14,16 @@ export default function App() {
     ttsProvider,
     setTtsProvider,
     ttsDebug,
+    startConversation,
+    endConversation,
+    sendTextFallback,
     startListening,
     stopListening,
-    sendTextFallback,
     forgetMe,
   } = useVoiceChat();
 
   const [typedText, setTypedText] = useState("");
+  const [handsFreeMode, setHandsFreeMode] = useState(true);
 
   const micDenied = errorText?.includes("Microphone access");
 
@@ -36,8 +39,11 @@ export default function App() {
       <main className="main">
         <MicButton
           state={state}
-          onStart={startListening}
-          onStop={stopListening}
+          handsFree={handsFreeMode}
+          onStartPushToTalk={startListening}
+          onStopPushToTalk={stopListening}
+          onStartConversation={startConversation}
+          onEndConversation={endConversation}
         />
 
         {errorText && (
@@ -72,16 +78,36 @@ export default function App() {
       </main>
 
       <div className="tts-toggle">
+        <span>Mode:</span>
+        <button
+          className={handsFreeMode ? "active" : ""}
+          onClick={() => setHandsFreeMode(true)}
+          disabled={state !== "idle"}
+        >
+          Hands-free
+        </button>
+        <button
+          className={!handsFreeMode ? "active" : ""}
+          onClick={() => setHandsFreeMode(false)}
+          disabled={state !== "idle"}
+        >
+          Push-to-talk
+        </button>
+      </div>
+
+      <div className="tts-toggle">
         <span>Voice:</span>
         <button
           className={ttsProvider === "browser" ? "active" : ""}
           onClick={() => setTtsProvider("browser")}
+          disabled={state !== "idle"}
         >
           Browser
         </button>
         <button
           className={ttsProvider === "groq" ? "active" : ""}
           onClick={() => setTtsProvider("groq")}
+          disabled={state !== "idle"}
         >
           Groq
         </button>
