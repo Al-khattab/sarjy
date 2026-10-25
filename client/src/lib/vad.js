@@ -24,7 +24,7 @@ const clamp = (value, lo, hi) => Math.min(hi, Math.max(lo, value));
 
 export const VAD_DEFAULTS = {
   // --- how thresholds are derived from the noise floor ---
-  speechMultiplier: 3, // speech threshold = noiseFloor x this (about +9.5 dB)
+  speechMultiplier: 2, // speech threshold = noiseFloor x this (about +9.5 dB)
   silenceMultiplier: 1.8, // "quiet again" threshold = noiseFloor x this
   minSpeechRms: 0.012, // lower bound on the speech threshold (quiet rooms)
   maxSpeechRms: 0.12, // upper bound (so a loud room can't make you unhearable)
