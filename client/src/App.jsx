@@ -95,7 +95,7 @@ export default function App() {
         </button>
       </div>
 
-      <div className="tts-toggle">
+      {/* <div className="tts-toggle">
         <span>Voice:</span>
         <button
           className={ttsProvider === "browser" ? "active" : ""}
@@ -118,7 +118,7 @@ export default function App() {
               ` (${ttsDebug.synthesisMs}ms synthesis)`}
           </span>
         )}
-      </div>
+      </div> */}
 
       <footer className="footer">
         <LatencyPanel timings={timings} ttfa={ttfa} />
